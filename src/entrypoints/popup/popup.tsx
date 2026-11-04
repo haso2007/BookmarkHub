@@ -11,8 +11,8 @@ import {
 } from 'react-icons/ai'
 import 'bootstrap/dist/css/bootstrap.min.css';
 import './popup.css'
-import iconLogo from '../../assets/icon.png'
 import optionsStorage from '../../utils/optionsStorage';
+import { showNotification } from '../../utils/notify';
 
 interface ConfirmAction {
     name: string;
@@ -100,12 +100,7 @@ const Popup: React.FC = () => {
             if (response.success) {
                 // 显示成功通知
                 const successMsg = type === 'github' ? browser.i18n.getMessage('testGithubSuccess') : browser.i18n.getMessage('testWebdavSuccess');
-                await browser.notifications.create({
-                    type: "basic",
-                    iconUrl: iconLogo,
-                    title: browser.i18n.getMessage('testConnection'),
-                    message: successMsg
-                });
+                await showNotification(browser.i18n.getMessage('testConnection'), successMsg);
             } else {
                 alert(`${browser.i18n.getMessage('testFailed')}: ${response.message}`);
             }
@@ -137,12 +132,7 @@ const Popup: React.FC = () => {
         };
         try {
             await navigator.clipboard.writeText(JSON.stringify(configData, null, 2));
-            await browser.notifications.create({
-                type: "basic",
-                iconUrl: iconLogo,
-                title: "配置导出",
-                message: "配置已复制到剪贴板"
-            });
+            await showNotification("配置导出", "配置已复制到剪贴板");
         } catch (e) {
             alert('复制失败，请手动复制');
         }
@@ -163,12 +153,7 @@ const Popup: React.FC = () => {
             setSettings(newSettings);
             setShowImportModal(false);
             setImportConfigText('');
-            await browser.notifications.create({
-                type: "basic",
-                iconUrl: iconLogo,
-                title: "配置导入",
-                message: "配置导入成功"
-            });
+            await showNotification("配置导入", "配置导入成功");
         } catch (e) {
             alert('配置格式错误，请检查JSON格式');
         }

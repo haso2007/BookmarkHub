@@ -1,13 +1,60 @@
 import BookmarkService from '../utils/services'
 import WebDAVService from '../utils/webdav'
 import { Setting } from '../utils/setting'
-import iconLogo from '../assets/icon.png'
+import { showNotification } from '../utils/notify'
 import { OperType, BookmarkInfo, SyncDataInfo, RootBookmarksType, BrowserType } from '../utils/models'
 import { Bookmarks } from 'wxt/browser'
 export default defineBackground(() => {
 
   const AUTO_SYNC_ALARM_NAME = 'bookmarkhub-auto-sync';
   let autoSyncPending = false; // 标记是否有待同步的变更
+
+  // Chrome MV3 exposes toolbar badges on browser.action. Firefox MV2 only has
+  // browser.browserAction. Calling the missing API throws before sendResponse,
+  // so the popup stays on "Processing..." and never shows the result.
+  type ToolbarAction = {
+    setBadgeText: (details: { text: string }) => Promise<void> | void;
+    setBadgeBackgroundColor: (details: { color: string }) => Promise<void> | void;
+  };
+
+  function getToolbarAction(): ToolbarAction | undefined {
+    const api = browser as typeof browser & { browserAction?: ToolbarAction };
+    return api.action ?? api.browserAction;
+  }
+
+  async function setToolbarBadge(text: string) {
+    const action = getToolbarAction();
+    if (!action) return;
+    try {
+      await action.setBadgeText({ text });
+      if (text) {
+        await action.setBadgeBackgroundColor({ color: "#F00" });
+      }
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  function replyWhenDone(
+    work: () => Promise<void>,
+    sendResponse: (response: unknown) => void,
+    cleanup?: () => Promise<void>
+  ) {
+    work()
+      .then(async () => {
+        if (cleanup) await cleanup();
+        sendResponse(true);
+      })
+      .catch(async (error) => {
+        console.error(error);
+        try {
+          if (cleanup) await cleanup();
+        } catch (cleanupError) {
+          console.error(cleanupError);
+        }
+        sendResponse(false);
+      });
+  }
 
   browser.runtime.onInstalled.addListener(c => {
     // 初始化自动同步
@@ -62,7 +109,7 @@ export default defineBackground(() => {
         curOperType = OperType.SYNC;
         await uploadBookmarks(setting.autoSyncNotify);
         curOperType = OperType.NONE;
-        browser.action.setBadgeText({ text: "" });
+        await setToolbarBadge("");
         autoSyncPending = false;
       }
     }
@@ -70,40 +117,32 @@ export default defineBackground(() => {
 
   let curOperType = OperType.NONE;
   let curBrowserType = BrowserType.CHROME;
+  const finishBookmarkOp = async () => {
+    curOperType = OperType.NONE;
+    await setToolbarBadge("");
+    await refreshLocalCount();
+  };
+
   browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.name === 'upload') {
-      curOperType = OperType.SYNC
-      uploadBookmarks().then(() => {
-        curOperType = OperType.NONE
-        browser.action.setBadgeText({ text: "" });
-        refreshLocalCount();
-        sendResponse(true);
-      });
+      curOperType = OperType.SYNC;
+      replyWhenDone(() => uploadBookmarks(), sendResponse, finishBookmarkOp);
     }
     if (msg.name === 'download') {
-      curOperType = OperType.SYNC
-      downloadBookmarks().then(() => {
-        curOperType = OperType.NONE
-        browser.action.setBadgeText({ text: "" });
-        refreshLocalCount();
-        sendResponse(true);
-      });
-
+      curOperType = OperType.SYNC;
+      replyWhenDone(() => downloadBookmarks(), sendResponse, finishBookmarkOp);
     }
     if (msg.name === 'removeAll') {
-      curOperType = OperType.REMOVE
-      clearBookmarkTree().then(() => {
-        curOperType = OperType.NONE
-        browser.action.setBadgeText({ text: "" });
-        refreshLocalCount();
-        sendResponse(true);
-      });
-
+      curOperType = OperType.REMOVE;
+      replyWhenDone(() => clearBookmarkTree(), sendResponse, finishBookmarkOp);
     }
     if (msg.name === 'setting') {
-      browser.runtime.openOptionsPage().then(() => {
-        sendResponse(true);
-      });
+      browser.runtime.openOptionsPage()
+        .then(() => sendResponse(true))
+        .catch(err => {
+          console.error(err);
+          sendResponse(false);
+        });
     }
     // 导出书签 - 获取格式化的书签数据
     if (msg.name === 'getBookmarksForExport') {
@@ -113,26 +152,18 @@ export default defineBackground(() => {
           version: browser.runtime.getManifest().version,
           bookmarks: formattedBookmarks
         });
+      }).catch(err => {
+        console.error(err);
+        sendResponse(false);
       });
     }
     // 导入书签 - 从临时存储读取并创建书签
     if (msg.name === 'importBookmarks') {
-      importBookmarksFromStorage().then(() => {
-        refreshLocalCount();
-        sendResponse(true);
-      }).catch(err => {
-        console.error('Import error:', err);
-        sendResponse(false);
-      });
+      replyWhenDone(() => importBookmarksFromStorage(), sendResponse, refreshLocalCount);
     }
     if (msg.name === 'sync') {
-      curOperType = OperType.SYNC
-      syncBookmarks().then(() => {
-        curOperType = OperType.NONE
-        browser.action.setBadgeText({ text: "" });
-        refreshLocalCount();
-        sendResponse(true);
-      });
+      curOperType = OperType.SYNC;
+      replyWhenDone(() => syncBookmarks(), sendResponse, finishBookmarkOp);
     }
     if (msg.name === 'testGithub') {
       BookmarkService.testConnection().then(() => sendResponse({ success: true }))
@@ -236,12 +267,12 @@ export default defineBackground(() => {
       await browser.storage.local.set({ remoteCount: count });
 
       if (setting.enableNotify) {
-        notifyMultiChannel(browser.i18n.getMessage('syncBookmarks'), results);
+        await notifyMultiChannel(browser.i18n.getMessage('syncBookmarks'), results);
       }
     } catch (error: any) {
       console.error('Sync error:', error);
       if (results.length > 0) {
-        notifyMultiChannel(browser.i18n.getMessage('syncBookmarks'), results);
+        await notifyMultiChannel(browser.i18n.getMessage('syncBookmarks'), results);
       } else {
         throw error;
       }
@@ -254,12 +285,7 @@ export default defineBackground(() => {
       `${r.service}: ${r.success ? '✅' : '❌'}${r.error ? ` (${r.error})` : ''}`
     ).join('\n');
 
-    browser.notifications.create({
-      type: "basic",
-      iconUrl: iconLogo,
-      title: title,
-      message: message
-    });
+    return showNotification(title, message);
   }
 
   // 辅助函数：合并两个书签树
@@ -287,8 +313,7 @@ export default defineBackground(() => {
   browser.bookmarks.onCreated.addListener((id, info) => {
     if (curOperType === OperType.NONE) {
       // console.log("onCreated", id, info)
-      browser.action.setBadgeText({ text: "!" });
-      browser.action.setBadgeBackgroundColor({ color: "#F00" });
+      void setToolbarBadge("!");
       refreshLocalCount();
       autoSyncPending = true; // 标记有待同步的变更
     }
@@ -296,24 +321,21 @@ export default defineBackground(() => {
   browser.bookmarks.onChanged.addListener((id, info) => {
     if (curOperType === OperType.NONE) {
       // console.log("onChanged", id, info)
-      browser.action.setBadgeText({ text: "!" });
-      browser.action.setBadgeBackgroundColor({ color: "#F00" });
+      void setToolbarBadge("!");
       autoSyncPending = true; // 标记有待同步的变更
     }
   })
   browser.bookmarks.onMoved.addListener((id, info) => {
     if (curOperType === OperType.NONE) {
       // console.log("onMoved", id, info)
-      browser.action.setBadgeText({ text: "!" });
-      browser.action.setBadgeBackgroundColor({ color: "#F00" });
+      void setToolbarBadge("!");
       autoSyncPending = true; // 标记有待同步的变更
     }
   })
   browser.bookmarks.onRemoved.addListener((id, info) => {
     if (curOperType === OperType.NONE) {
       // console.log("onRemoved", id, info)
-      browser.action.setBadgeText({ text: "!" });
-      browser.action.setBadgeBackgroundColor({ color: "#F00" });
+      void setToolbarBadge("!");
       refreshLocalCount();
       autoSyncPending = true; // 标记有待同步的变更
     }
@@ -367,21 +389,19 @@ export default defineBackground(() => {
       // showNotify 参数用于自动同步时控制是否显示通知
       const shouldNotify = showNotify !== undefined ? showNotify : setting.enableNotify;
       if (shouldNotify) {
-        notifyMultiChannel(browser.i18n.getMessage('uploadBookmarks'), results);
+        await notifyMultiChannel(browser.i18n.getMessage('uploadBookmarks'), results);
       }
 
     }
     catch (error: any) {
       console.error(error);
       if (results.length > 0) {
-        notifyMultiChannel(browser.i18n.getMessage('uploadBookmarks'), results);
+        await notifyMultiChannel(browser.i18n.getMessage('uploadBookmarks'), results);
       } else {
-        browser.notifications.create({
-          type: "basic",
-          iconUrl: iconLogo,
-          title: browser.i18n.getMessage('uploadBookmarks'),
-          message: `${browser.i18n.getMessage('error')}：${error.message}`
-        });
+        await showNotification(
+          browser.i18n.getMessage('uploadBookmarks'),
+          `${browser.i18n.getMessage('error')}：${error.message}`
+        );
       }
     }
   }
@@ -450,24 +470,22 @@ export default defineBackground(() => {
         await browser.storage.local.set({ remoteCount: count });
 
         if (setting.enableNotify) {
-          notifyMultiChannel(browser.i18n.getMessage('downloadBookmarks'), results);
+          await notifyMultiChannel(browser.i18n.getMessage('downloadBookmarks'), results);
         }
       }
       else {
-        notifyMultiChannel(browser.i18n.getMessage('downloadBookmarks'), results);
+        await notifyMultiChannel(browser.i18n.getMessage('downloadBookmarks'), results);
       }
     }
     catch (error: any) {
       console.error(error);
       if (results.length > 0) {
-        notifyMultiChannel(browser.i18n.getMessage('downloadBookmarks'), results);
+        await notifyMultiChannel(browser.i18n.getMessage('downloadBookmarks'), results);
       } else {
-        browser.notifications.create({
-          type: "basic",
-          iconUrl: iconLogo,
-          title: browser.i18n.getMessage('downloadBookmarks'),
-          message: `${browser.i18n.getMessage('error')}：${error.message}`
-        });
+        await showNotification(
+          browser.i18n.getMessage('downloadBookmarks'),
+          `${browser.i18n.getMessage('error')}：${error.message}`
+        );
       }
     }
   }
@@ -501,22 +519,18 @@ export default defineBackground(() => {
         }
       }
       if (curOperType === OperType.REMOVE && setting.enableNotify) {
-        await browser.notifications.create({
-          type: "basic",
-          iconUrl: iconLogo,
-          title: browser.i18n.getMessage('removeAllBookmarks'),
-          message: browser.i18n.getMessage('success')
-        });
+        await showNotification(
+          browser.i18n.getMessage('removeAllBookmarks'),
+          browser.i18n.getMessage('success')
+        );
       }
     }
     catch (error: any) {
       console.error(error);
-      await browser.notifications.create({
-        type: "basic",
-        iconUrl: iconLogo,
-        title: browser.i18n.getMessage('removeAllBookmarks'),
-        message: `${browser.i18n.getMessage('error')}：${error.message}`
-      });
+      await showNotification(
+        browser.i18n.getMessage('removeAllBookmarks'),
+        `${browser.i18n.getMessage('error')}：${error.message}`
+      );
     }
   }
 
@@ -689,27 +703,23 @@ export default defineBackground(() => {
       await browser.storage.local.remove('pendingImport');
 
       curOperType = OperType.NONE;
-      browser.action.setBadgeText({ text: "" });
+      await setToolbarBadge("");
 
       // 发送通知
       let setting = await Setting.build();
       if (setting.enableNotify) {
-        await browser.notifications.create({
-          type: "basic",
-          iconUrl: iconLogo,
-          title: browser.i18n.getMessage('importBookmarks'),
-          message: browser.i18n.getMessage('success')
-        });
+        await showNotification(
+          browser.i18n.getMessage('importBookmarks'),
+          browser.i18n.getMessage('success')
+        );
       }
     } catch (error: any) {
       curOperType = OperType.NONE;
       console.error('Import error:', error);
-      await browser.notifications.create({
-        type: "basic",
-        iconUrl: iconLogo,
-        title: browser.i18n.getMessage('importBookmarks'),
-        message: `${browser.i18n.getMessage('error')}：${error.message}`
-      });
+      await showNotification(
+        browser.i18n.getMessage('importBookmarks'),
+        `${browser.i18n.getMessage('error')}：${error.message}`
+      );
       throw error;
     }
   }
@@ -822,12 +832,7 @@ export default defineBackground(() => {
 
     // 显示通知
     if (setting.enableNotify) {
-      await browser.notifications.create({
-        type: "basic",
-        iconUrl: iconLogo,
-        title: "图标加载完成",
-        message: `已为 ${loadedCount} 个网站加载图标`
-      });
+      await showNotification("图标加载完成", `已为 ${loadedCount} 个网站加载图标`);
     }
   }
 
